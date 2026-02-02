@@ -1,32 +1,9 @@
 use nalgebra as na;
+use crate::forces::{force_gravity, drag_force};
+use crate::objects::Projectile;
 
-struct Projectile {
-    mass: f32,
-    effective_area: f32,
-    position: na::Vector3<f32>,
-    velocity: na::Vector3<f32>,
-    drag_coefficient: f32,
-}
-
-fn atmospheric_density(_altitude: f32) -> f32 {
-    // Simplified model: constant density
-    return 1.225; // kg/m^3 at sea level
-}
-
-fn force_gravity() -> na::Vector3<f32> {
-    return na::Vector3::new(0.0, -9.81, 0.0)
-}
-
-fn drag_force(projectile: &Projectile) -> na::Vector3<f32> {
-
-    let velocity = projectile.velocity;
-    let speed = velocity.norm();
-    let _altitude = projectile.position.y;
-    let density = atmospheric_density(_altitude);
-    let drag_coefficient = projectile.drag_coefficient;
-    let area = projectile.effective_area;
-    return -0.5 * density * speed * drag_coefficient * area * velocity;
-}
+pub mod forces;
+pub mod objects;
 
 fn update_projectile(projectile: &mut Projectile, time_step: f32) {
     //Update the projectile's position and velocity based on forces acting on it.
