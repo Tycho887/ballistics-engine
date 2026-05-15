@@ -1,124 +1,145 @@
-extern crate log;
-extern crate nyx_space as nyx;
-extern crate pretty_env_logger as pel;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use anise::{
     almanac::metaload::MetaFile,
-    constants::{
-        celestial_objects::{MOON, SUN},
-        frames::{EARTH_J2000, IAU_EARTH_FRAME},
-    },
+    constants::frames::{EARTH_J2000, IAU_EARTH_FRAME},
 };
 use hifitime::{Epoch, Unit};
-use log::warn;
 use nyx::{
-    cosmic::{Mass, MetaAlmanac, Orbit, SRPData},
+    cosmic::{Mass, MetaAlmanac, Orbit, SRPData, Spacecraft, State},
     dynamics::{Harmonics, OrbitalDynamics, SolarPressure, SpacecraftDynamics},
     io::{gravity::HarmonicsMem, ExportCfg},
-    od::GroundStation,
+    od::prelude::*,
+    od::simulator::{Strand, TrackingArcSim, TrkConfig},
+    od::msr::{MeasurementType, TrackingDataArc},
     propagators::Propagator,
-    Spacecraft, State,
-};
-use polars::{
-    frame::column::ScalarColumn,
-    prelude::{df, AnyValue, ChunkCompareIneq, Column, DataType, Scalar},
 };
 
-use std::{error::Error, sync::Arc};
-
-struct TLE {
-    name: String,
-    line1: String,
-    line2: String,
-}
-
-struct TLEData {
-    name: String,
-    epoch: Epoch,
-    inclination: f64,
-    raan: f64,
-    eccentricity: f64,
-    arg_perigee: f64,
-    mean_anomaly: f64,
-    mean_motion: f64,
-    BSTAR: f64,
-}
-
-fn splitTLE(tle: &str) -> TLE {
-    let lines: Vec<&str> = tle.lines().collect();
-    if lines.len() != 3 {
-        panic!("TLE must have exactly 3 lines");
-    }
-    TLE {
-        name: lines[0].to_string(),
-        line1: lines[1].to_string(),
-        line2: lines[2].to_string(),
-    }
-}
-
-fn parseTLE(tle: &TLE) -> TLEData {
-    let line1 = &tle.line1;
-    let line2 = &tle.line2;
-
-    // Parse line 1
-    let epoch_year = line1[18..20].parse::<u32>().unwrap();
-    let epoch_day = line1[20..32].parse::<f64>().unwrap();
-    let epoch = Epoch::from_gregorian_utc_hms(2000 + epoch_year, 1, 1, 0, 0, 0)
-        + hifitime::Duration::from_seconds(epoch_day * 24.0 * 3600.0);
-
-    // Parse line 2
-    let inclination = line2[8..16].trim().parse::<f64>().unwrap();
-    let raan = line2[17..25].trim().parse::<f64>().unwrap();
-    let eccentricity = line2[26..33].trim().parse::<f64>().unwrap() / 1e7;
-    let arg_perigee = line2[34..42].trim().parse::<f64>().unwrap();
-    let mean_anomaly = line2[43..51].trim().parse::<f64>().unwrap();
-    let mean_motion = line2[52..63].trim().parse::<f64>().unwrap();
-    let bstar = line1[53..61].trim().parse::<f64>().unwrap();
-
-    TLEData {
-        name: tle.name.clone(),
-        epoch,
-        inclination,
-        raan,
-        eccentricity,
-        arg_perigee,
-        mean_anomaly,
-        mean_motion,
-        BSTAR: bstar,
-    }
-}
-
-fn tle_to_orbit(tle_data: &TLEData, frame: &dyn anise::frames::Frame) -> Orbit {
-    let mu = frame.mu();
-    let a = (mu / (tle_data.mean_motion * 2.0 * std::f64::consts::PI / 86400.0).powi(2)).powf(1.0 / 3.0);
-    Orbit::try_keplerian_altitude(
-        a - frame.radius(), // altitude
-        tle_data.eccentricity,
-        tle_data.inclination,
-        tle_data.raan,
-        tle_data.arg_perigee,
-        tle_data.mean_anomaly,
-        tle_data.epoch,
-        frame.clone(),
-    ).unwrap()
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    pel::init();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --- Almanac & initial orbit (same as your example) ---
     let almanac = Arc::new(MetaAlmanac::latest().map_err(Box::new)?);
+    let epoch = Epoch::from_gregorian_utc_hms(2024, 2, 29, 12, 13, 14);
     let earth_j2000 = almanac.frame_info(EARTH_J2000)?;
 
-    let tle = splitTLE(
-        "ISS (ZARYA)
-        1 25544U 98067A   26135.16618096  .00004382  00000-0  87007-4 0  9997
-        2 25544  51.6313 103.5621 0007452  60.7339 299.4393 15.49219006566637"
+    let orbit = Orbit::try_keplerian_altitude(
+        300.0, 0.015, 68.5, 65.2, 75.0, 0.0, epoch, earth_j2000,
+    )?;
+
+    let sc = Spacecraft::builder()
+        .orbit(orbit)
+        .mass(Mass::from_dry_mass(9.60))
+        .srp(SRPData {
+            area_m2: 10e-4,
+            coeff_reflectivity: 1.1,
+        })
+        .build();
+
+    // --- High-fidelity dynamics & propagation (same as your example) ---
+    let mut orbital_dyn = OrbitalDynamics::point_masses(vec![nyx::cosmic::MOON, nyx::cosmic::SUN]);
+
+    let mut jgm3_meta = MetaFile {
+        uri: "http://public-data.nyxspace.com/nyx/models/JGM3.cof.gz".to_string(),
+        crc32: Some(0xF446F027),
+    };
+    jgm3_meta.process(true)?;
+
+    let harmonics_21x21 = Harmonics::from_stor(
+        almanac.frame_info(IAU_EARTH_FRAME)?,
+        HarmonicsMem::from_cof(&jgm3_meta.uri, 21, 21, true).unwrap(),
     );
-    let tle_data = parseTLE(&tle);
-    println!("{:?}", tle_data);
+    orbital_dyn.accel_models.push(harmonics_21x21);
 
-    let orbit = tle_to_orbit(&tle_data, &earth_j2000);
+    let srp_dyn = SolarPressure::default(EARTH_J2000, almanac.clone())?;
+    let dynamics = SpacecraftDynamics::from_model(orbital_dyn, srp_dyn);
 
-    println!("{orbit:x}");
+    let (_, trajectory) = Propagator::default(dynamics)
+        .with(sc, almanac.clone())
+        .until_epoch_with_traj(epoch + Unit::Day * 3)?;
+
+    // ============================================================
+    // 1. Configure a ground station with Range + Doppler (range-rate)
+    // ============================================================
+    let boulder_station = GroundStation::from_point(
+        "Boulder, CO, USA".to_string(),
+        40.014984,   // lat (deg)
+        -105.270546, // lon (deg)
+        1.6550,      // alt (km)
+        almanac.frame_info(IAU_EARTH_FRAME)?,
+    )
+    // Add the measurement types you want to simulate.
+    // Use appropriate stochastic noise for your hardware (examples below).
+    .with_msr_type(
+        MeasurementType::Range,
+        StochasticNoise::from_hardware_range_km(
+            1e-11,               // Allan deviation
+            10.0.seconds(),
+            link_specific::ChipRate::StandardT4B,
+            link_specific::SN0::Average,
+        ),
+    )
+    .with_msr_type(
+        MeasurementType::Doppler,
+        StochasticNoise::from_hardware_doppler_km_s(
+            1e-11,               // Allan deviation
+            10.0.seconds(),
+            link_specific::CarrierFreq::SBand,
+            link_specific::CN0::Average,
+        ),
+    );
+
+    let mut devices = BTreeMap::new();
+    devices.insert("Boulder, CO, USA".to_string(), boulder_station);
+
+    // ============================================================
+    // 2. Define tracking schedule (when to collect measurements)
+    // ============================================================
+    let mut configs = BTreeMap::new();
+    configs.insert(
+        "Boulder, CO, USA".to_string(),
+        TrkConfig::builder()
+            .strands(vec![Strand {
+                start: epoch,
+                end: epoch + Unit::Day * 3,
+            }])
+            .build(),
+    );
+
+    // ============================================================
+    // 3. Simulate the tracking arc
+    // ============================================================
+    let mut trk = TrackingArcSim::<Spacecraft, GroundStation>::with_seed(
+        devices,
+        trajectory,
+        configs,
+        123, // RNG seed for reproducibility
+    )?;
+    trk.build_schedule(almanac.clone())?;
+    let arc = trk.generate_measurements(almanac.clone())?;
+
+    println!("Generated tracking arc: {}", arc);
+
+    // ============================================================
+    // 4. Export to CCSDS TDM v2.0
+    // ============================================================
+    // Aliases let you rename the ground station / spacecraft in the TDM file.
+    let mut aliases = HashMap::new();
+    aliases.insert("Boulder, CO, USA".to_string(), "Boulder".to_string());
+
+    let tdm_path = arc.to_tdm_file(
+        "CubeSat".to_string(),      // PARTICIPANT_2 (spacecraft) name in TDM
+        Some(aliases),              // optional name remapping
+        "./boulder_cubesat.tdm",    // output path
+        ExportCfg::default(),
+    )?;
+
+    println!("TDM written to: {}", tdm_path.display());
+
+    // ============================================================
+    // 5. (Optional) Read it back
+    // ============================================================
+    let arc_rtn = TrackingDataArc::from_tdm(&tdm_path, None)?;
+    println!("Read back from TDM: {}", arc_rtn);
 
     Ok(())
-}
+}   
